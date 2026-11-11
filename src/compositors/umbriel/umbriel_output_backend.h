@@ -13,7 +13,8 @@ namespace compositors::umbriel {
 } // namespace compositors::umbriel
 
 // Caches focused output and power changes from the persistent event stream.
-// Power decisions use a fresh snapshot to include commands not yet dispatched in the stream.
+// outputPowerStates() takes a fresh snapshot to include commands not yet dispatched in
+// the stream; cachedOutputPowerStates() is for callers that must not block on IPC.
 // The focused workspace names the output even when that workspace is empty.
 class UmbrielOutputBackend final : public compositors::umbriel::UmbrielEventHandler {
 public:
@@ -21,6 +22,10 @@ public:
 
   std::optional<std::string> focusedOutputName() const;
   std::unordered_map<std::string, bool> outputPowerStates() const;
+  /// The states last pushed on the event stream. No IPC. Umbriel sends an outputs
+  /// snapshot right after the stream subscribes, so this is empty only until that
+  /// arrives (or after the stream drops).
+  const std::unordered_map<std::string, bool>& cachedOutputPowerStates() const noexcept { return m_outputPowerStates; }
   void setOutputPowerChangeCallback(std::function<void()> callback);
 
   void handleEvent(std::string_view event, const nlohmann::json& data) override;
