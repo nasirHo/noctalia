@@ -317,13 +317,50 @@ Find answers to common setup and troubleshooting questions for Noctalia.
 <FaqItem question="Why can't I unlock my lock screen?">
   Noctalia authenticates through PAM using the `login` service by default. Your distribution may build it with a dedicated service instead (Meson option `pam_service`). Make sure `/etc/pam.d/<service>` exists and is valid for your distribution.
 
-  If you changed your PAM stack for fingerprint, security key, or other authentication methods, make sure those changes are present in the PAM service used by Noctalia.
+  If you changed your PAM stack for a security key or other authentication methods, make sure those changes are present in the PAM service used by Noctalia.
+
+  Noctalia drives the fingerprint reader itself over D-Bus and runs face unlock in its own `noctalia-face` service. If the PAM service Noctalia uses for passwords also contains `pam_fprintd` or `pam_gaze`, for example because it is `login` and you set those up for console logins, the password check can wait for that device, so unlocking with a password is slower. Security keys and other modules that only need the typed password or a touch don't have this problem.
 
   After a successful PAM unlock, Noctalia asks the same PAM stack to refresh existing credentials, such as Kerberos tickets or PAM-integrated GPG and keyring credentials.
 
   If the log says `noctalia-pam-helper not found`, the installation is incomplete: the helper must be installed next to the `noctalia` binary or in `<libexecdir>/noctalia/`.
 
   If Noctalia was built on another system than the one it runs on (for example installed through Nix on Ubuntu, Debian, or Arch), its own `noctalia-pam-helper` links a libpam that cannot use your distribution's `/etc/pam.d`, and every password is rejected. Build the helper on the host (`meson setup build && meson compile -C build noctalia-pam-helper`, from the same Noctalia version) and set `NOCTALIA_PAM_HELPER_PATH` to its absolute path in the environment Noctalia starts from, such as your compositor's autostart or `home.sessionVariables`.
+</FaqItem>
+
+<FaqItem question="How do I set up face unlock?" id="face-unlock">
+  Face unlock uses [Gaze](https://gaze.gundulabs.com). Install Gaze and enroll your face first, then create `/etc/pam.d/noctalia-face`:
+
+  ```
+  auth     requisite                              pam_nologin.so
+  auth     requisite                              pam_faillock.so preauth
+  auth     [success=2 auth_err=ignore default=1]  pam_gaze.so
+  auth     [default=die]                          pam_faillock.so authfail
+  auth     requisite                              pam_deny.so
+  auth     required                               pam_faillock.so authsucc
+  account  required                               pam_nologin.so
+  account  required                               pam_unix.so
+  password required                               pam_deny.so
+  ```
+
+  The file must be a regular file owned by root, readable by everyone, and not writable by group or others (symlinks, as on NixOS, are fine). Otherwise face unlock stays off, Noctalia logs a warning, and **Settings → Lock Screen** says what is wrong.
+
+  Noctalia only unlocks when this service returns success after Gaze reported a verified face. A face that Gaze judges and rejects counts toward the same `pam_faillock` limit as a wrong password, while "no face", "too dark", and "unavailable" results don't. The `account` lines must succeed too: if they fail, or can't read your account data, the attempt counts as unavailable. So does a failure of Noctalia's face PAM helper, `noctalia-face-pam-helper`, since PAM decided nothing. Face unlock doesn't run `pam_setcred`, so unlike a password unlock it doesn't refresh Kerberos tickets or keyring credentials.
+
+  Then turn on **Face Unlock** under **Settings → Lock Screen**, or set `face = true` under `[lockscreen]`. Face unlock is off by default, and stays idle while this file is missing or you have no enrolled faces. With everything in place:
+
+  - Locking doesn't start a scan, because you're usually still in front of the camera. A scan starts when the screen wakes after being off, when you press Enter on an empty password field, or when you move the mouse or press a key that doesn't type (such as Shift) once `face_lock_cooldown_ms` has passed since the lock (default 5 seconds, also under **Settings → Lock Screen**). With a `grace_period_seconds` window, the cooldown starts when that window ends instead, and the mouse or keys never start a scan during it. Gaze's own `start_delay_ms` is measured from the lock, so a scan started by the mouse or a key begins at the later of the two: the end of grace plus the cooldown, or Gaze's delay. Pressing Enter or waking the screen skips Noctalia's cooldown, but Gaze still waits out what remains of its own delay.
+  - Typing in the password field stops the scan, and the password always works.
+  - If a scan saw no usable face (for example you were away), move the mouse or press a key that doesn't type to scan again.
+  - After a face is rejected, Noctalia doesn't rescan on its own, and Enter waits 5 seconds before it tries again. Each rejected face counts toward `pam_faillock`, so anyone at the keyboard can raise your lockout count by pressing Enter, just as they can by typing wrong passwords.
+  - If Gaze asks for confirmation after a match (`require_confirmation_lock_screen`), press Enter on an empty password field within 10 seconds, or Escape to dismiss it. It takes a new press: holding down the Enter that started the scan doesn't confirm. An unanswered or dismissed confirmation doesn't count as a failed attempt; press Enter to scan again.
+  - With `allow_empty_password = true`, Enter on an empty field runs your password stack first (for example a security-key touch with `pam_u2f`), and starts a face scan only if that attempt fails. The two never run at once. If your password stack uses `pam_faillock`, that failed empty attempt counts toward it like any wrong password.
+  - Noctalia waits as long as Gaze's own time limit (12 seconds plus Gaze's longest start delay) before it gives up on a scan.
+  - Noctalia never starts a scan while it knows all screens are off: after it powered them off during the lock, while a power-off is pending, or when the compositor reports them off (only Umbriel reports this during a lock). A compositor or idle daemon that turns the screens off on its own without telling Noctalia, such as `hypridle` or `swayidle` running `dpms off`, can't be detected, so a scan that is already running may finish in the dark.
+
+  If the log says `noctalia-face-pam-helper not found`, the installation is incomplete: the helper must be installed next to the `noctalia` binary or in `<libexecdir>/noctalia/`, and face unlock stays unavailable until it is.
+
+  Fingerprint unlock is independent and keeps working alongside face unlock.
 </FaqItem>
 
 <FaqItem question="Does the lock screen engage before suspend?">

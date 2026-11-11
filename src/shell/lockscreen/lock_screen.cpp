@@ -1,5 +1,7 @@
 #include "shell/lockscreen/lock_screen.h"
 
+#include "auth/face_authenticator.h"
+#include "auth/face_screen_coordinator.h"
 #include "auth/fingerprint_authenticator.h"
 #include "capture/screencopy_util.h"
 #include "compositors/compositor_platform.h"
@@ -7,6 +9,7 @@
 #include "config/config_types.h"
 #include "core/deferred_call.h"
 #include "core/input/key_chord.h"
+#include "core/input/key_symbols.h"
 #include "core/input/keybind_matcher.h"
 #include "core/log.h"
 #include "core/random.h"
@@ -16,6 +19,7 @@
 #include "shell/desktop/desktop_widget_layout.h"
 #include "shell/keyboard_layout_label.h"
 #include "shell/lockscreen/lock_surface.h"
+#include "shell/lockscreen/lockscreen_face_keys.h"
 #include "shell/lockscreen/lockscreen_session_actions.h"
 #include "shell/session/session_action_runner.h"
 #include "shell/wallpaper/wallpaper_geometry.h"
@@ -104,6 +108,27 @@ namespace {
 
 } // namespace
 
+// Applies LockScreen's gates (locked, not unlocking, face enabled) to the coordinator's actions.
+class LockScreen::FaceScreenTarget final : public face::ScreenTarget {
+public:
+  explicit FaceScreenTarget(LockScreen& screen) : m_screen(screen) {}
+
+  void setScreenOn(bool on) override {
+    if (m_screen.m_face != nullptr) {
+      m_screen.m_face->setScreenOn(on);
+    }
+  }
+  void start() override { m_screen.startFace(); }
+  void beginLock() override {
+    if (m_screen.m_face != nullptr) {
+      m_screen.m_face->beginLock(m_screen.m_faceGracePending);
+    }
+  }
+
+private:
+  LockScreen& m_screen;
+};
+
 LockScreen::LockScreen() = default;
 
 LockScreen::~LockScreen() {
@@ -136,6 +161,24 @@ bool LockScreen::initialize(
     m_fingerprint->setStatusCallback([this](const std::string& message, bool isError) {
       handleFingerprintStatus(message, isError);
     });
+
+    m_face = std::make_unique<FaceAuthenticator>(*m_systemBus);
+    m_face->setEnabled(faceEnabled());
+    m_face->setLockCooldown(faceLockCooldown());
+    m_faceScreenTarget = std::make_unique<FaceScreenTarget>(*this);
+    m_faceScreen = std::make_unique<face::ScreenCoordinator>(*m_faceScreenTarget, [this] {
+      return m_compositorPlatform != nullptr && m_compositorPlatform->allOutputsKnownOff();
+    });
+    m_face->setAuthenticatedCallback([this] {
+      if (!m_locked || m_unlocking) {
+        return;
+      }
+      m_status = i18n::tr("lockscreen.unlocked");
+      m_statusIsError = false;
+      updatePromptOnSurfaces();
+      unlock();
+    });
+    m_face->setStatusCallback([this](const std::string& message, bool isError) { handleFaceStatus(message, isError); });
   }
   return true;
 }
@@ -279,6 +322,7 @@ void LockScreen::unlock() {
   resetGracePeriod();
   invalidatePendingAuthentication();
   stopFingerprint();
+  stopFace();
 
   if (m_locked) {
     m_unlocking = true;
@@ -440,6 +484,13 @@ void LockScreen::onConfigChanged() {
   if (m_configService == nullptr) {
     return;
   }
+  if (m_face != nullptr) {
+    // Turning face unlock on mid-lock doesn't scan by itself: presence or Enter does.
+    m_face->setEnabled(faceEnabled());
+    m_face->setLockCooldown(faceLockCooldown());
+  }
+  // The grace length may have changed: end it now or wait for the new deadline.
+  syncFaceGraceEnd();
   if (!m_configService->isLockScreenEnabled()) {
     if (isActive()) {
       unlock();
@@ -497,6 +548,12 @@ void LockScreen::onPointerEvent(const PointerEvent& event) {
     }
   }
 
+  if (event.type == PointerEvent::Type::Motion
+      || event.type == PointerEvent::Type::Button
+      || event.type == PointerEvent::Type::Axis) {
+    noteUserPresence();
+  }
+
   wl_surface* target = event.surface != nullptr ? event.surface : m_pointerSurface;
   if (target == nullptr) {
     return;
@@ -521,12 +578,26 @@ void LockScreen::onKeyboardEvent(const KeyboardEvent& event) {
     return;
   }
   if (!event.pressed) {
+    // Modifiers count on release, so Shift+letter while typing never starts a scan:
+    // by then the letter has made the password non-empty.
+    if (KeySymbol::isModifier(event.sym)) {
+      noteUserPresence();
+    }
     return;
   }
 
   if (isInGracePeriod()) {
     tryGraceUnlock();
     return;
+  }
+
+  // Keys that never type into the field (arrows, Escape, function keys…) show the
+  // user is back. Wake keys count too. Enter has its own path through tryAuthenticate().
+  if (!event.repeat
+      && !KeySymbol::isModifier(event.sym)
+      && !isPlainPrintableKey(event.utf32, event.modifiers, event.preedit)
+      && !KeybindMatcher::matches(KeybindAction::Validate, event.sym, event.modifiers)) {
+    noteUserPresence();
   }
 
   LockSurface* targetSurface = nullptr;
@@ -556,13 +627,21 @@ void LockScreen::onKeyboardEvent(const KeyboardEvent& event) {
   // chord but must type a space, not submit (passwords may contain spaces).
   if (!isPlainPrintableKey(event.utf32, event.modifiers, event.preedit)
       && KeybindMatcher::matches(KeybindAction::Validate, event.sym, event.modifiers)) {
-    tryAuthenticate();
+    if (!event.repeat) {
+      m_validatePressedAt = std::chrono::steady_clock::now();
+    }
+    tryAuthenticate(event.repeat, m_validatePressedAt);
     return;
   }
 
   // Cancel clears a non-empty password before any action shortcut bound to the
   // same key can fire, so a stray key mid-password never runs a session action.
   const bool cancel = KeybindMatcher::matches(KeybindAction::Cancel, event.sym, event.modifiers);
+  // Escape dismisses a verified face waiting for Enter; nothing else runs on that key.
+  if (lockscreen::faceKeyAction(faceKeyContext(), false, cancel, event.repeat) == lockscreen::FaceKeyAction::Decline) {
+    m_face->declineConfirmation();
+    return;
+  }
   if ((!cancel || m_password.empty())
       && !isPlainPrintableKey(event.utf32, event.modifiers, event.preedit)
       && tryActionShortcut(event.sym, event.modifiers)) {
@@ -606,20 +685,52 @@ bool LockScreen::tryActionShortcut(std::uint32_t sym, std::uint32_t modifiers) {
 
 void LockScreen::markOutputsWoke() { m_wokeAtMillis = bootTimeMillis(); }
 
+void LockScreen::onOutputsPoweredOn() {
+  if (m_faceScreen != nullptr) {
+    m_faceScreen->outputsPoweredOn();
+  }
+}
+
 bool LockScreen::isActive() const noexcept { return m_lockPending || m_locked; }
 
-bool LockScreen::isInGracePeriod() const noexcept {
+bool LockScreen::isInGracePeriod() const noexcept { return graceRemainingMillis() > 0; }
+
+std::int64_t LockScreen::graceRemainingMillis() const noexcept {
   if (!m_graceAllowed || !m_locked || m_lockedAtMillis <= 0) {
-    return false;
+    return 0;
   }
   if (m_configService == nullptr || m_configService->config().lockscreen.gracePeriodSeconds <= 0) {
-    return false;
+    return 0;
   }
   // Boottime deadline, evaluated fresh on every interaction: a cached timestamp
   // would keep the grace window alive indefinitely.
   const std::int64_t windowMillis =
       static_cast<std::int64_t>(m_configService->config().lockscreen.gracePeriodSeconds) * 1000;
-  return bootTimeMillis() < m_lockedAtMillis + windowMillis;
+  return std::max<std::int64_t>(0, m_lockedAtMillis + windowMillis - bootTimeMillis());
+}
+
+void LockScreen::syncFaceGraceEnd() {
+  if (!m_faceGracePending) {
+    return;
+  }
+  const std::int64_t remaining = graceRemainingMillis();
+  if (remaining <= 0) {
+    endFaceGrace();
+    return;
+  }
+  // Re-checked on expiry: the deadline is on the boottime clock, the timer is not.
+  m_faceGraceTimer.start(std::chrono::milliseconds(remaining), [this] { syncFaceGraceEnd(); });
+}
+
+void LockScreen::endFaceGrace() {
+  m_faceGraceTimer.stop();
+  if (!m_faceGracePending) {
+    return;
+  }
+  m_faceGracePending = false;
+  if (m_face != nullptr) {
+    m_face->graceEnded();
+  }
 }
 
 void LockScreen::tryGraceUnlock() {
@@ -633,6 +744,8 @@ void LockScreen::tryGraceUnlock() {
 void LockScreen::resetGracePeriod() {
   m_lockedAtMillis = 0;
   m_graceAllowed = false;
+  // Revoking grace ends it: the face lock cooldown starts now. No-op without a lock.
+  endFaceGrace();
 }
 
 void LockScreen::onSystemResumed() {
@@ -643,6 +756,11 @@ void LockScreen::onSystemResumed() {
   resetGracePeriod();
   cancelPendingAfterLocked();
   cancelOutputPowerOff();
+  // Anything the face lane had in flight was frozen across suspend; drop it and run
+  // a fresh wake scan. Gaze may abort that one itself (auth.abort_before_first_resume).
+  if (m_faceScreen != nullptr) {
+    m_faceScreen->resumed();
+  }
 }
 
 bool LockScreen::isSessionLocked() const noexcept { return m_locked; }
@@ -679,6 +797,11 @@ void LockScreen::onOutputPowerChanged() {
   if (m_compositorPlatform == nullptr) {
     return;
   }
+  // Only some backends report power changes (Umbriel today); others rely on
+  // prepareForOutputPowerOff() / onOutputsPoweredOn() and on presence signals.
+  if (m_faceScreen != nullptr && isActive()) {
+    m_faceScreen->powerStateReported();
+  }
   if (!m_compositorPlatform->shouldSuppressLockTransition()) {
     markOutputsWoke();
     return;
@@ -694,6 +817,10 @@ void LockScreen::prepareForOutputPowerOff(std::function<void(bool)> done) {
   cancelOutputPowerOff();
   if (!done) {
     return;
+  }
+  // The camera must be idle before the screen goes dark, whatever the lock-frame state.
+  if (m_faceScreen != nullptr) {
+    m_faceScreen->powerOffPrepared();
   }
   if (m_unlocking) {
     done(false);
@@ -723,6 +850,10 @@ void LockScreen::cancelOutputPowerOff() {
     auto pending = std::move(m_pendingOutputPowerOff);
     m_pendingOutputPowerOff = {};
     pending(false);
+    // The power-off was aborted, so the screen never went dark: lift the block, no scan.
+    if (m_faceScreen != nullptr) {
+      m_faceScreen->powerOffAborted();
+    }
   }
 }
 
@@ -887,7 +1018,7 @@ void LockScreen::handleLocked(void* data, ext_session_lock_v1* /*lock*/) {
   self->m_statusIsError = false;
   for (auto& instance : self->m_instances) {
     instance.surface->setLockedState(true);
-    instance.surface->setOnLogin([self] { self->tryAuthenticate(); });
+    instance.surface->setOnLogin([self] { self->tryAuthenticate(false, std::chrono::steady_clock::now()); });
     instance.surface->startEnterTransition();
   }
 
@@ -896,6 +1027,18 @@ void LockScreen::handleLocked(void* data, ext_session_lock_v1* /*lock*/) {
   self->updatePromptOnSurfaces();
   self->updateIndicatorsOnSurfaces();
   self->startFingerprint();
+  // No face scan here: the user who just locked is usually still at the camera. The
+  // first scan comes from a wake, Enter, or presence after the lock cooldown.
+  self->m_faceStatus.clear();
+  // With a grace window open, the lock cooldown starts when it ends rather than now:
+  // otherwise it could run out inside the window and a stray move right after grace
+  // would scan the user who just locked.
+  self->m_faceGraceTimer.stop();
+  self->m_faceGracePending = self->isInGracePeriod();
+  if (self->m_faceScreen != nullptr) {
+    self->m_faceScreen->locked();
+  }
+  self->syncFaceGraceEnd();
   kLog.info("session is locked");
   if (self->m_onSessionLocked) {
     self->m_onSessionLocked();
@@ -915,6 +1058,7 @@ void LockScreen::handleFinished(void* data, ext_session_lock_v1* /*lock*/) {
   self->m_unlockFinishQueued = false;
   self->invalidatePendingAuthentication();
   self->stopFingerprint();
+  self->stopFace();
 
   if (self->m_lock != nullptr) {
     if (self->m_locked) {
@@ -1325,7 +1469,7 @@ void LockScreen::createInstance(const WaylandOutput& output) {
   surface->configureTransition(transition, m_transitionParams, m_transitionDurationMs);
   surface->setSleepReadyCallback([this] { handleSleepReady(); });
   surface->setTransitionCallback([this] { handleTransitionStateChanged(); });
-  surface->setOnLogin([this] { tryAuthenticate(); });
+  surface->setOnLogin([this] { tryAuthenticate(false, std::chrono::steady_clock::now()); });
   surface->setOnCycleLayout([this] { cycleKeyboardLayout(); });
   surface->setOnPasswordChanged([this](const std::string& value) { handlePasswordEdited(value); });
   surface->setLoginBoxServices(m_sessionActions, m_mpris, m_weather, m_httpClient);
@@ -1443,6 +1587,10 @@ void LockScreen::invalidatePendingAuthentication() {
 }
 
 void LockScreen::handlePasswordEdited(const std::string& value) {
+  if (!value.empty()) {
+    // Typing wins: the password field never competes with a face scan.
+    stopFace();
+  }
   if (m_authenticating) {
     m_password = value;
     updatePromptOnSurfaces();
@@ -1457,24 +1605,45 @@ void LockScreen::handlePasswordEdited(const std::string& value) {
   updatePromptOnSurfaces();
 }
 
-void LockScreen::tryAuthenticate() {
+lockscreen::FaceKeyContext LockScreen::faceKeyContext() const {
+  const bool allowEmptyPassword = m_configService != nullptr && m_configService->config().lockscreen.allowEmptyPassword;
+  return lockscreen::FaceKeyContext{
+      .passwordEmpty = m_password.empty(),
+      .confirming = m_face != nullptr && m_face->isConfirming(),
+      .retryOnEmptyEnter = m_face != nullptr && faceEnabled() && !allowEmptyPassword,
+  };
+}
+
+void LockScreen::tryAuthenticate(bool repeat, std::chrono::steady_clock::time_point pressedAt) {
   if (m_authenticating || !m_locked || m_unlocking) {
     return;
   }
-  if (m_password.empty()) {
-    const bool allowEmptyPassword =
-        m_configService != nullptr && m_configService->config().lockscreen.allowEmptyPassword;
-    if (!allowEmptyPassword) {
-      return;
-    }
+  // Enter on an empty field confirms a verified face, or retries the face scan.
+  switch (lockscreen::faceKeyAction(faceKeyContext(), true, false, repeat)) {
+  case lockscreen::FaceKeyAction::Ignore:
+    return;
+  case lockscreen::FaceKeyAction::Confirm:
+    m_face->confirm(pressedAt);
+    return;
+  case lockscreen::FaceKeyAction::Retry:
+    m_face->retry();
+    return;
+  case lockscreen::FaceKeyAction::None:
+  case lockscreen::FaceKeyAction::Decline:
+    break;
+  }
+  if (m_password.empty() && (m_configService == nullptr || !m_configService->config().lockscreen.allowEmptyPassword)) {
+    return;
   }
 
   stopFingerprint();
+  stopFace();
   if (m_wayland != nullptr) {
     m_wayland->stopKeyRepeat();
   }
 
   std::string password = m_password;
+  m_authSubmittedEmpty = password.empty();
   clearSensitiveString(m_password);
 
   const std::uint64_t generation = ++m_authGeneration;
@@ -1520,6 +1689,15 @@ void LockScreen::handleAuthResult(std::uint64_t generation, const PamAuthenticat
   m_statusIsError = true;
   updatePromptOnSurfaces();
   startFingerprint();
+  // The face lane was stopped so it wouldn't race the security-key check; that check failed.
+  if (lockscreen::faceRetryAfterPasswordFailure({
+          .submittedEmpty = m_authSubmittedEmpty,
+          .passwordEmpty = m_password.empty(),
+          .locked = m_locked && !m_unlocking,
+          .faceEnabled = m_face != nullptr && faceEnabled(),
+      })) {
+    m_face->retry();
+  }
 }
 
 void LockScreen::startFingerprint() {
@@ -1548,6 +1726,54 @@ void LockScreen::handleFingerprintStatus(const std::string& message, bool isErro
   }
   // Empty message means verification disarmed; fall back to the idle prompt (rendered by the surface).
   m_status = message.empty() ? std::string{} : message;
+  m_statusIsError = isError;
+  updatePromptOnSurfaces();
+}
+
+bool LockScreen::faceEnabled() const { return m_configService != nullptr && m_configService->config().lockscreen.face; }
+
+std::chrono::milliseconds LockScreen::faceLockCooldown() const {
+  if (m_configService == nullptr) {
+    return face::LanePolicy::kDefaultLockCooldown;
+  }
+  return std::chrono::milliseconds(m_configService->config().lockscreen.faceLockCooldownMs);
+}
+
+void LockScreen::startFace() {
+  if (m_face == nullptr || !faceEnabled() || !m_locked || m_unlocking) {
+    return;
+  }
+  m_face->start();
+}
+
+void LockScreen::stopFace() {
+  if (m_face != nullptr) {
+    m_face->stop();
+  }
+}
+
+void LockScreen::noteUserPresence() {
+  if (m_face == nullptr || !m_locked || m_unlocking || m_authenticating || !m_password.empty()) {
+    return;
+  }
+  m_face->noteUserPresence();
+}
+
+void LockScreen::handleFaceStatus(const std::string& message, bool isError) {
+  if (!isActive() || m_authenticating) {
+    return;
+  }
+  // Same rule as fingerprint: don't clobber a password the user is typing.
+  if (!m_password.empty()) {
+    return;
+  }
+  if (message.empty() && m_status != m_faceStatus) {
+    // Withdraw only the face lane's own hint, never another lane's message.
+    m_faceStatus.clear();
+    return;
+  }
+  m_faceStatus = message;
+  m_status = message;
   m_statusIsError = isError;
   updatePromptOnSurfaces();
 }

@@ -1,3 +1,4 @@
+#include "auth/pam_service.h"
 #include "calendar/calendar_service.h"
 #include "compositors/compositor_detect.h"
 #include "compositors/compositor_platform.h"
@@ -764,6 +765,7 @@ settings::RegistryEnvironment SettingsWindow::buildRegistryEnvironment() const {
       m_wayland != nullptr && m_wayland->extension<ShellGlobals>().gammaControlManager() != nullptr;
   env.greeterSyncAvailable =
       m_config != nullptr && greeter::appearanceSyncAvailable(m_config->config().shell.greeterSync);
+  env.faceServiceTrust = pam_service::inspectServiceFile(pam_service::kFace);
   const ThemeMode previewMode = m_config != nullptr ? shellThemeMode(m_config->config().theme) : ThemeMode::Dark;
   for (const auto& paletteInfo : noctalia::theme::availableCommunityPalettes()) {
     env.communityPalettes.push_back(

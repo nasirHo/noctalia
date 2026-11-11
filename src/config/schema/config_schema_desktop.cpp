@@ -26,6 +26,8 @@ namespace noctalia::config::schema {
         field(&LockscreenConfig::dnd, "dnd"),
         field(&LockscreenConfig::gracePeriodSeconds, "grace_period_seconds", Range<std::int64_t>{0, 60}),
         field(&LockscreenConfig::fingerprint, "fingerprint"),
+        field(&LockscreenConfig::face, "face"),
+        field(&LockscreenConfig::faceLockCooldownMs, "face_lock_cooldown_ms", Range<std::int64_t>{0, 60000}),
         field(&LockscreenConfig::allowEmptyPassword, "allow_empty_password"),
         field(&LockscreenConfig::blurredDesktop, "blurred_desktop"),
         enumArrayField(

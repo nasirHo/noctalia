@@ -225,7 +225,7 @@ lib/                Shared UI library (noctalia-ui); self-contained, built witho
 src/
   main.cpp          Entry point
   app/              Application bootstrap, build info, main loop, poll sources
-  auth/             PAM and fingerprint authentication
+  auth/             PAM, fingerprint and face authentication
   calendar/         CalDAV, Google Calendar, iCalendar parsing, polling
   capture/          Screenshots, screencopy capture, region overlay
   compositors/      Compositor detection, runtime adapters, workspace/output/keyboard backends
