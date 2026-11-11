@@ -623,6 +623,12 @@ struct LockscreenConfig {
   // and on logind resume as a defense in depth.
   int gracePeriodSeconds = 0;
   bool fingerprint = true;
+  // Face unlock through Gaze's "noctalia-face" PAM service. Off until the user turns it on:
+  // the scan is passive, so consent comes from the user's own config.
+  bool face = false;
+  // After a lock begins, input must wait this long before it can start the first face
+  // scan, so the user who just locked isn't unlocked again. A wake or Enter scans at once.
+  int faceLockCooldownMs = 5000;
   bool allowEmptyPassword = false;
   bool blurredDesktop = false;
   std::vector<LockscreenTransition> transitions = {LockscreenTransition::Fade,    LockscreenTransition::Wipe,
