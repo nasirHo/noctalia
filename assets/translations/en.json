@@ -1,5 +1,14 @@
 {
   "auth": {
+    "face": {
+      "confirm-expired": "Face confirmation timed out — press Enter to scan again",
+      "failed": "Face authentication failed",
+      "look": "Look at the camera",
+      "not-detected": "No face detected — move the mouse to try again",
+      "not-recognized": "Face not recognized",
+      "too-dark": "Too dark for face unlock — move the mouse to try again",
+      "unavailable": "Face unlock unavailable"
+    },
     "fingerprint": {
       "disconnected": "Fingerprint reader disconnected",
       "error": "Fingerprint authentication error",
@@ -925,6 +934,9 @@
     "authenticating": "Authenticating…",
     "authentication-failed": "Authentication failed",
     "caps-lock-on": "Caps Lock is on",
+    "face": {
+      "confirm": "Face verified — press Enter to unlock"
+    },
     "password-cleared": "Password cleared",
     "password-placeholder": "Password",
     "ready": "Type your password and press Enter.",
@@ -2626,6 +2638,16 @@
         "enabled": {
           "description": "Enable session lock, logind integration, and lock actions",
           "label": "Lock Screen"
+        },
+        "face": {
+          "description": "Unlock by looking at the camera with Gaze, alongside password entry",
+          "label": "Face Unlock",
+          "requires-pam-service": "Create /etc/pam.d/noctalia-face to enable face unlock, as described in the face unlock FAQ",
+          "untrusted-pam-service": "The noctalia-face PAM file must be a regular file owned by root, readable by everyone, and not writable by group or others"
+        },
+        "face-lock-cooldown": {
+          "description": "After locking, or after the grace period ends, how long mouse or key activity waits before it can start a face scan. Waking the screen or pressing Enter scans at once",
+          "label": "Face Unlock Cooldown"
         },
         "fingerprint": {
           "description": "Unlock with a fingerprint reader via fprintd, alongside password entry",

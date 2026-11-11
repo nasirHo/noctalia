@@ -5,6 +5,7 @@
 #include "core/timer_manager.h"
 #include "shell/render/lockscreen_transition_types.h"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -24,6 +25,7 @@ struct wl_output;
 class ConfigService;
 
 class CompositorPlatform;
+class FaceAuthenticator;
 class FingerprintAuthenticator;
 class HttpClient;
 class LockSurface;
@@ -35,6 +37,14 @@ class SystemBus;
 class WaylandConnection;
 class WeatherService;
 enum class LockscreenTransition : std::uint8_t;
+
+namespace lockscreen {
+  struct FaceKeyContext;
+} // namespace lockscreen
+
+namespace face {
+  class ScreenCoordinator;
+}
 
 class LockScreen {
 public:
@@ -87,6 +97,8 @@ public:
   void onOutputPowerChanged();
   /// Outputs were powered back on; keys right after this are wake keys.
   void markOutputsWoke();
+  /// Noctalia powered the outputs back on: the face lane may scan again.
+  void onOutputsPoweredOn();
 
   template <typename Fn> void forEachSurface(Fn&& fn) {
     for (auto& instance : m_instances) {
@@ -146,17 +158,37 @@ private:
   void applyIndicatorsToSurface(LockSurface& surface) const;
   void cycleKeyboardLayout();
   void handlePasswordEdited(const std::string& value);
-  void tryAuthenticate();
+  /// Enter, or the login button. `repeat` marks a held Enter's autorepeat, and
+  /// `pressedAt` is when that Enter went down; both keep a held key from confirming a face.
+  void tryAuthenticate(bool repeat, std::chrono::steady_clock::time_point pressedAt);
+  lockscreen::FaceKeyContext faceKeyContext() const;
   void handleAuthResult(std::uint64_t generation, const PamAuthenticator::Result& result);
   void invalidatePendingAuthentication();
   void startFingerprint();
   void stopFingerprint();
   void handleFingerprintStatus(const std::string& message, bool isError);
+  bool faceEnabled() const;
+  std::chrono::milliseconds faceLockCooldown() const;
+  /// A wake's automatic face scan, if the lock is up and face unlock is on.
+  void startFace();
+  void stopFace();
+  void handleFaceStatus(const std::string& message, bool isError);
+  /// Pointer activity or a key that doesn't type: may start the first face scan after
+  /// the lock cooldown, or retry after an undecided scan. Ignored while the user is
+  /// entering a password.
+  void noteUserPresence();
   static void clearSensitiveString(std::string& value);
   /// Passwordless grace window: any keypress or pointer movement beyond 5px unlocks
   /// without a password while the window is live (matches hyprlock).
   bool isInGracePeriod() const noexcept;
+  /// Milliseconds left in the grace window; 0 when it is closed.
+  std::int64_t graceRemainingMillis() const noexcept;
   void tryGraceUnlock();
+  /// While the face lane waits for this lock's grace to end: tells it now if grace has
+  /// closed, or (re)arms m_faceGraceTimer for the time left.
+  void syncFaceGraceEnd();
+  /// Tells the face lane grace ended, at most once per lock; it starts the lock cooldown.
+  void endFaceGrace();
   /// Runs the lock-screen action bound to this chord. True when the chord is bound
   /// (even if suppressed as a wake key), so the key is consumed.
   bool tryActionShortcut(std::uint32_t sym, std::uint32_t modifiers);
@@ -172,13 +204,24 @@ private:
   std::unordered_map<wl_output*, ScreencopyImage> m_desktopCaptures;
   PamAuthenticator m_authenticator;
   std::unique_ptr<FingerprintAuthenticator> m_fingerprint;
+  std::unique_ptr<FaceAuthenticator> m_face;
+  class FaceScreenTarget;
+  std::unique_ptr<FaceScreenTarget> m_faceScreenTarget;
+  // Turns lock and output-power events into face lane screen state and wake scans.
+  std::unique_ptr<face::ScreenCoordinator> m_faceScreen;
+  // Last status the face lane showed, so clearing it never wipes another lane's message.
+  std::string m_faceStatus;
   std::string m_user;
   std::string m_password;
+  // When the Enter currently held (or last pressed) went down; its repeats share it.
+  std::chrono::steady_clock::time_point m_validatePressedAt;
   std::string m_status;
   wl_surface* m_pointerSurface = nullptr;
   bool m_statusIsError = false;
   bool m_authenticating = false;
   std::uint64_t m_authGeneration = 0;
+  // Whether the attempt for m_authGeneration was submitted with an empty password.
+  bool m_authSubmittedEmpty = false;
   bool m_lockPending = false;
   bool m_locked = false;
   bool m_lockStarting = false;
@@ -210,6 +253,10 @@ private:
   // CLOCK_BOOTTIME millis when the lock flow started; grace expires gracePeriodSeconds after it.
   std::int64_t m_lockedAtMillis = 0;
   bool m_graceAllowed = false;
+  // The face lane was told this lock has a grace window and hasn't yet heard it ended.
+  bool m_faceGracePending = false;
+  // Fires when the grace window runs out, so the face lock cooldown starts from there.
+  Timer m_faceGraceTimer;
   // CLOCK_BOOTTIME millis of the last resume or output power-on; guards wake keys.
   std::int64_t m_wokeAtMillis = 0;
   double m_pointerEnterX = 0.0;

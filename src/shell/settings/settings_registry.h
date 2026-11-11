@@ -1,5 +1,6 @@
 #pragma once
 
+#include "auth/pam_service.h"
 #include "config/config_types.h"
 #include "core/input/key_chord.h"
 #include "theme/builtin_templates.h"
@@ -321,6 +322,8 @@ namespace settings {
     bool systemdUserManaged = false;            // disable systemd app launching when the shell is not a user unit
     bool gammaControlAvailable = false;         // hide night-light entries when gamma control is unavailable
     bool greeterSyncAvailable = false;          // hide greeter appearance sync when greeter is not installed
+    // Explain in the face unlock description why the noctalia-face PAM service keeps the lane idle.
+    pam_service::FileTrust faceServiceTrust = pam_service::FileTrust::Trusted;
     std::vector<SelectOption> availableOutputs; // monitor selectors available on this machine
     bool batteryAvailable = false;
     bool systemBatteryAvailable = false;

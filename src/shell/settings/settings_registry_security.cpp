@@ -1,3 +1,4 @@
+#include "auth/pam_service.h"
 #include "config/config_types.h"
 #include "config/schema/ranges.h"
 #include "i18n/i18n.h"
@@ -16,6 +17,22 @@
 #include <vector>
 
 namespace settings::registry {
+
+  namespace {
+
+    std::string faceDescription(pam_service::FileTrust trust) {
+      switch (trust) {
+      case pam_service::FileTrust::Missing:
+        return i18n::tr("settings.schema.lockscreen.face.requires-pam-service");
+      case pam_service::FileTrust::Untrusted:
+        return i18n::tr("settings.schema.lockscreen.face.untrusted-pam-service");
+      case pam_service::FileTrust::Trusted:
+        break;
+      }
+      return i18n::tr("settings.schema.lockscreen.face.description");
+    }
+
+  } // namespace
 
   void addSecuritySettings(std::vector<SettingEntry>& entries, const Config& cfg) {
     using i18n::tr;
@@ -129,6 +146,31 @@ namespace settings::registry {
           ToggleSetting{cfg.lockscreen.fingerprint}, "lock screen fingerprint fprintd biometric"
       );
       e.visibleWhen = lockscreenOn;
+      entries.push_back(std::move(e));
+    }
+    {
+      auto e = makeEntry(
+          SettingsSection::LockScreen, "authentication", tr("settings.schema.lockscreen.face.label"),
+          faceDescription(env.faceServiceTrust), {"lockscreen", "face"}, ToggleSetting{cfg.lockscreen.face},
+          "lock screen face gaze camera biometric"
+      );
+      e.visibleWhen = lockscreenOn;
+      entries.push_back(std::move(e));
+    }
+    {
+      auto e = makeEntry(
+          SettingsSection::LockScreen, "authentication", tr("settings.schema.lockscreen.face-lock-cooldown.label"),
+          tr("settings.schema.lockscreen.face-lock-cooldown.description"), {"lockscreen", "face_lock_cooldown_ms"},
+          StepperSetting{
+              .value = std::clamp(cfg.lockscreen.faceLockCooldownMs, 0, 60000),
+              .minValue = 0,
+              .maxValue = 60000,
+              .step = 500,
+              .valueSuffix = "ms"
+          },
+          "lock screen face gaze camera cooldown delay"
+      );
+      e.visibleWhen = [](const Config& c) { return c.lockscreen.enabled && c.lockscreen.face; };
       entries.push_back(std::move(e));
     }
     {
