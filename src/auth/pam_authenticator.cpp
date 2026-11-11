@@ -1,15 +1,20 @@
 #include "auth/pam_authenticator.h"
 
+#include "auth/pam_helper_protocol.h"
+#include "auth/pam_service.h"
+#include "auth/posix_io.h"
 #include "core/log.h"
 #include "i18n/i18n.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <fcntl.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -23,16 +28,23 @@ namespace {
 
   constexpr Logger kLog("pam");
 
+  // Runs inside a helper entry point's catch block: a throw from the logger there would
+  // escape into main() instead of the documented exit status 2.
+  void logHelperFailure(const char* helper, const char* what) noexcept {
+    try {
+      kLog.error("{} failed: {}", helper, what);
+    } catch (...) {
+      // Exit status 2 still reports the failure.
+    }
+  }
+
   constexpr std::size_t kMaxPamMessageBytes = 4096;
   constexpr std::size_t kMaxPasswordBytes = 64 * 1024;
 
-  void secureClear(std::string& value) {
-    volatile char* ptr = value.empty() ? nullptr : value.data();
-    for (std::size_t i = 0; i < value.size(); ++i) {
-      ptr[i] = '\0';
-    }
-    value.clear();
-  }
+  using posix_io::readAll;
+  using posix_io::secureClear;
+  using posix_io::UniqueFd;
+  using posix_io::writeAll;
 
   struct PamConversationData {
     const char* password = nullptr;
@@ -54,7 +66,8 @@ namespace {
     }
   };
 
-  int pamConversation(int numMsg, const pam_message** msg, pam_response** response, void* appdataPtr) {
+  // Only C calls (calloc, strdup): nothing here can throw into libpam.
+  int pamConversation(int numMsg, const pam_message** msg, pam_response** response, void* appdataPtr) noexcept {
     if (numMsg <= 0 || msg == nullptr || response == nullptr || appdataPtr == nullptr) {
       return PAM_CONV_ERR;
     }
@@ -118,77 +131,25 @@ namespace {
     return PAM_SUCCESS;
   }
 
-  [[nodiscard]] bool writeAll(int fd, const void* data, std::size_t len) {
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    std::size_t remaining = len;
-    while (remaining > 0) {
-      const ssize_t n = ::write(fd, bytes, remaining);
-      if (n > 0) {
-        bytes += static_cast<std::size_t>(n);
-        remaining -= static_cast<std::size_t>(n);
-      } else if (n < 0 && errno == EINTR) {
-        continue;
-      } else {
-        return false;
-      }
-    }
-    return true;
-  }
+  struct Pipe {
+    UniqueFd read;
+    UniqueFd write;
+  };
 
-  [[nodiscard]] bool readAll(int fd, void* data, std::size_t len) {
-    auto* bytes = static_cast<std::uint8_t*>(data);
-    std::size_t remaining = len;
-    while (remaining > 0) {
-      const ssize_t n = ::read(fd, bytes, remaining);
-      if (n > 0) {
-        bytes += static_cast<std::size_t>(n);
-        remaining -= static_cast<std::size_t>(n);
-      } else if (n < 0 && errno == EINTR) {
-        continue;
-      } else {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  void closeFd(int& fd) {
-    if (fd >= 0) {
-      (void)::close(fd);
-      fd = -1;
-    }
-  }
-
-  void closePipe(int (&pipeFds)[2]) {
-    closeFd(pipeFds[0]);
-    closeFd(pipeFds[1]);
-  }
-
-  [[nodiscard]] bool moveFdAboveStdio(int& fd) {
-    if (fd > STDERR_FILENO) {
-      return true;
-    }
-
-    int movedFd = -1;
-    do {
-      movedFd = ::fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
-    } while (movedFd < 0 && errno == EINTR);
-    if (movedFd < 0) {
+  [[nodiscard]] bool createPipe(Pipe& pipe) {
+    int fds[2] = {-1, -1};
+    if (::pipe2(fds, O_CLOEXEC) != 0) {
       return false;
     }
-
-    closeFd(fd);
-    fd = movedFd;
-    return true;
+    pipe.read.reset(fds[0]);
+    pipe.write.reset(fds[1]);
+    return posix_io::moveAboveStdio(pipe.read) && posix_io::moveAboveStdio(pipe.write);
   }
 
-  [[nodiscard]] bool createPipe(int (&pipeFds)[2]) {
-    if (::pipe2(pipeFds, O_CLOEXEC) != 0 || !moveFdAboveStdio(pipeFds[0]) || !moveFdAboveStdio(pipeFds[1])) {
-      closePipe(pipeFds);
-      return false;
-    }
-    return true;
-  }
+  // Both conversation functions run under libpam (C) and its modules: unwinding into
+  // them is undefined behavior.
+  static_assert(noexcept(pamConversation(0, nullptr, nullptr, nullptr)));
+  static_assert(noexcept(pam_protocol::interactiveConversation(0, nullptr, nullptr, nullptr)));
 
   [[nodiscard]] bool sendPassword(int fd, std::string_view password) {
     sigset_t pipeMask;
@@ -269,19 +230,17 @@ namespace {
     return true;
   }
 
-  PamAuthenticator::Result authenticateDirect(std::string_view password, std::string_view service) {
-    std::string user = PamAuthenticator::currentUsername();
-    if (user.empty()) {
-      return PamAuthenticator::Result{.success = false, .message = i18n::tr("auth.pam.user-unavailable")};
-    }
+  struct [[nodiscard]] PamSequenceResult {
+    int rc = PAM_SYSTEM_ERR;
+    bool started = false;
+    std::string message;
+  };
 
-    std::string passwordCopy(password);
-    PamConversationData convData{.password = passwordCopy.c_str()};
-    pam_conv conv = {
-        .conv = &pamConversation,
-        .appdata_ptr = &convData,
-    };
-
+  // pam_start → pam_authenticate → pam_acct_mgmt (→ pam_setcred), shared by the
+  // one-shot password helper and the interactive helper.
+  PamSequenceResult runPamSequence(
+      std::string_view service, const std::string& user, const pam_conv& conv, pam_service::PamSequencePolicy policy
+  ) {
     kLog.debug("authenticating user='{}' service='{}'", user, service);
 
     PamHandle pamh;
@@ -291,18 +250,26 @@ namespace {
       kLog.error(
           "pam_start failed rc={} ({})", startRc, pamh.h != nullptr ? pam_strerror(pamh.h, startRc) : "no handle"
       );
-      secureClear(passwordCopy);
-      return PamAuthenticator::Result{.success = false, .message = i18n::tr("auth.pam.start-failed")};
+      return PamSequenceResult{
+          .rc = startRc != PAM_SUCCESS ? startRc : PAM_SYSTEM_ERR,
+          .started = false,
+          .message = i18n::tr("auth.pam.start-failed"),
+      };
     }
 
     int rc = pam_authenticate(pamh.h, 0);
     kLog.debug("pam_authenticate rc={} ({})", rc, pam_strerror(pamh.h, rc));
     if (rc == PAM_SUCCESS) {
-      // An unprivileged locker can't read /etc/shadow for the account stack, so
-      // ignore PAM_AUTHINFO_UNAVAIL; pam_authenticate already proved identity.
       const int acctRc = pam_acct_mgmt(pamh.h, 0);
       kLog.debug("pam_acct_mgmt rc={} ({})", acctRc, pam_strerror(pamh.h, acctRc));
-      if (acctRc != PAM_SUCCESS && acctRc != PAM_AUTHINFO_UNAVAIL) {
+      if (!pam_service::acctResultAccepted(acctRc, policy)) {
+        if (acctRc == PAM_AUTHINFO_UNAVAIL) {
+          kLog.warn(
+              "pam_acct_mgmt for service '{}' could not read account data (PAM_AUTHINFO_UNAVAIL); this service needs "
+              "an account stack that works without root",
+              service
+          );
+        }
         rc = acctRc;
       }
     }
@@ -310,7 +277,7 @@ namespace {
     const std::string errStr = err != nullptr ? err : i18n::tr("auth.pam.authentication-failed");
     pamh.lastRc = rc;
 
-    if (rc == PAM_SUCCESS) {
+    if (rc == PAM_SUCCESS && policy.refreshCredentials) {
       // A credential-provider failure must not reject an otherwise valid unlock.
       const int credRc = pam_setcred(pamh.h, PAM_REFRESH_CRED);
       kLog.debug("pam_setcred PAM_REFRESH_CRED rc={} ({})", credRc, pam_strerror(pamh.h, credRc));
@@ -320,15 +287,31 @@ namespace {
       }
     }
 
-    secureClear(passwordCopy);
-
     if (rc == PAM_SUCCESS) {
       kLog.debug("authentication succeeded for user='{}'", user);
-      return PamAuthenticator::Result{.success = true, .message = {}};
+      return PamSequenceResult{.rc = rc, .started = true, .message = {}};
     }
 
     kLog.warn("authentication failed for user='{}' rc={} ({})", user, rc, errStr);
-    return PamAuthenticator::Result{.success = false, .message = errStr};
+    return PamSequenceResult{.rc = rc, .started = true, .message = errStr};
+  }
+
+  PamAuthenticator::Result authenticateDirect(std::string_view password, std::string_view service) {
+    std::string user = PamAuthenticator::currentUsername();
+    if (user.empty()) {
+      return PamAuthenticator::Result{.success = false, .message = i18n::tr("auth.pam.user-unavailable")};
+    }
+
+    std::string passwordCopy(password);
+    PamConversationData convData{.password = passwordCopy.c_str()};
+    const pam_conv conv = {
+        .conv = &pamConversation,
+        .appdata_ptr = &convData,
+    };
+
+    PamSequenceResult result = runPamSequence(service, user, conv, pam_service::kPasswordPolicy);
+    secureClear(passwordCopy);
+    return PamAuthenticator::Result{.success = result.rc == PAM_SUCCESS, .message = std::move(result.message)};
   }
 
 } // namespace
@@ -346,52 +329,39 @@ PamAuthenticator::Result PamAuthenticator::authenticateCurrentUser(
     return fail();
   }
 
-  std::string serviceCopy(service);
-  std::string languageCopy(language);
+  // Owned, writable argument buffers: execv() takes char* const*.
+  std::array<std::string, 4> args = {"noctalia", "pam-helper", std::string(service), std::string(language)};
+  std::array<char*, 5> helperArgv = {args[0].data(), args[1].data(), args[2].data(), args[3].data(), nullptr};
 
-  int inPipe[2] = {-1, -1};
-  int outPipe[2] = {-1, -1};
-  if (!createPipe(inPipe)) {
+  Pipe inPipe;
+  Pipe outPipe;
+  if (!createPipe(inPipe) || !createPipe(outPipe)) {
     return fail();
   }
-  if (!createPipe(outPipe)) {
-    closePipe(inPipe);
-    return fail();
-  }
-
-  const char* helperArgv[] = {
-      "noctalia", "pam-helper", serviceCopy.c_str(), languageCopy.c_str(), nullptr,
-  };
 
   const pid_t pid = ::fork();
   if (pid < 0) {
-    closePipe(inPipe);
-    closePipe(outPipe);
     return fail();
   }
 
   if (pid == 0) {
-    // Keep this path async-signal-safe until execv().
-    if (::dup2(inPipe[0], STDIN_FILENO) < 0 || ::dup2(outPipe[1], STDOUT_FILENO) < 0) {
+    // Keep this path async-signal-safe until execv(). Every pipe end is CLOEXEC.
+    if (::dup2(inPipe.read.get(), STDIN_FILENO) < 0 || ::dup2(outPipe.write.get(), STDOUT_FILENO) < 0) {
       ::_exit(127);
     }
-    (void)::close(inPipe[0]);
-    (void)::close(inPipe[1]);
-    (void)::close(outPipe[0]);
-    (void)::close(outPipe[1]);
-    ::execv("/proc/self/exe", const_cast<char* const*>(helperArgv));
+    ::execv("/proc/self/exe", helperArgv.data());
     ::_exit(127);
   }
 
-  closeFd(inPipe[0]);
-  closeFd(outPipe[1]);
+  inPipe.read.reset();
+  outPipe.write.reset();
 
-  const bool sentOk = sendPassword(inPipe[1], password);
-  closeFd(inPipe[1]);
+  const bool sentOk = sendPassword(inPipe.write.get(), password);
+  inPipe.write.reset();
 
   Result result;
-  const bool readOk = sentOk && readResult(outPipe[0], result);
-  closeFd(outPipe[0]);
+  const bool readOk = sentOk && readResult(outPipe.read.get(), result);
+  outPipe.read.reset();
 
   int status = 0;
   pid_t waitResult = -1;
@@ -414,6 +384,33 @@ PamAuthenticator::Result PamAuthenticator::authenticateCurrentUser(
 }
 
 int PamAuthenticator::runHelperMode(int argc, char* argv[]) {
+  pam_protocol::hardenHelperProcess();
+  // No exception may escape into main(): exit 2 is "helper failed", which the parent
+  // treats as an authentication failure.
+  try {
+    return runHelperModeUnguarded(argc, argv);
+  } catch (const std::exception& e) {
+    logHelperFailure("pam helper", e.what());
+  } catch (...) {
+    logHelperFailure("pam helper", "unknown exception");
+  }
+  return 2;
+}
+
+int PamAuthenticator::runInteractiveHelperMode(int argc, char* argv[]) {
+  pam_protocol::hardenHelperProcess();
+  // Exit 2 without a Result frame: the parent reports PAM_SYSTEM_ERR, never success.
+  try {
+    return runInteractiveHelperModeUnguarded(argc, argv);
+  } catch (const std::exception& e) {
+    logHelperFailure("interactive pam helper", e.what());
+  } catch (...) {
+    logHelperFailure("interactive pam helper", "unknown exception");
+  }
+  return 2;
+}
+
+int PamAuthenticator::runHelperModeUnguarded(int argc, char* argv[]) {
   if (argc != 4 || argv[2][0] == '\0' || argv[3][0] == '\0') {
     return 2;
   }
@@ -442,6 +439,47 @@ int PamAuthenticator::runHelperMode(int argc, char* argv[]) {
     return 2;
   }
   return result.success ? 0 : 1;
+}
+
+int PamAuthenticator::runInteractiveHelperModeUnguarded(int argc, char* argv[]) {
+  if (argc != 4 || argv[2][0] == '\0' || argv[3][0] == '\0') {
+    return 2;
+  }
+
+  const std::string_view service = argv[2];
+  const std::string_view language = argv[3];
+  i18n::Service::instance().init(language);
+  if (i18n::Service::instance().language() != language) {
+    return 2;
+  }
+
+  // Each prompt is relayed to the parent, which answers with a reply or an abort.
+  pam_protocol::ConversationChannel channel{.inFd = STDIN_FILENO, .outFd = STDOUT_FILENO};
+  const pam_conv conv = {
+      .conv = &pam_protocol::interactiveConversation,
+      .appdata_ptr = &channel,
+  };
+
+  PamSequenceResult result;
+  const std::string user = currentUsername();
+  if (user.empty()) {
+    result =
+        PamSequenceResult{.rc = PAM_USER_UNKNOWN, .started = false, .message = i18n::tr("auth.pam.user-unavailable")};
+  } else {
+    // The interactive helper only serves the face lane.
+    result = runPamSequence(service, user, conv, pam_service::kFacePolicy);
+  }
+
+  const pam_protocol::Frame frame{
+      .type = pam_protocol::FrameType::Result,
+      .rc = result.rc,
+      .started = result.started,
+      .text = result.message,
+  };
+  if (!pam_protocol::writeFrame(STDOUT_FILENO, frame)) {
+    return 2;
+  }
+  return result.rc == PAM_SUCCESS ? 0 : 1;
 }
 
 std::string PamAuthenticator::currentUsername() {

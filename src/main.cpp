@@ -311,6 +311,9 @@ int main(int argc, char* argv[]) {
     if (std::strcmp(argv[1], "pam-helper") == 0) {
       return PamAuthenticator::runHelperMode(argc, argv);
     }
+    if (std::strcmp(argv[1], "pam-helper-interactive") == 0) {
+      return PamAuthenticator::runInteractiveHelperMode(argc, argv);
+    }
     if (std::strcmp(argv[1], "config") == 0) {
       return noctalia::config::runCli(argc, argv);
     }
