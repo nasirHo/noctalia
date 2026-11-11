@@ -16,6 +16,7 @@
 #include "compositors/niri/niri_output_backend.h"
 #include "compositors/niri/niri_runtime.h"
 #include "compositors/niri/niri_workspace_backend.h"
+#include "compositors/output_power_state.h"
 #include "compositors/sway/sway_keyboard_backend.h"
 #include "compositors/sway/sway_output_backend.h"
 #include "compositors/sway/sway_runtime.h"
@@ -56,6 +57,9 @@ namespace compositors {
     virtual ~FocusedOutputBackend() = default;
     virtual std::optional<std::string> focusedOutputName() const = 0;
     virtual std::unordered_map<std::string, bool> outputPowerStates() const = 0;
+    /// States the backend already holds from pushed change events; empty for backends
+    /// that only answer queries. Never does IPC: it reads only a backend's cache.
+    virtual std::unordered_map<std::string, bool> pushedOutputPowerStates() const = 0;
     virtual void setOutputPowerChangeCallback(CompositorPlatform::ChangeCallback callback) = 0;
   };
 
@@ -247,6 +251,12 @@ namespace {
     }
   }
 
+  // Only Umbriel pushes output power changes; the others would need a query.
+  static_assert(compositors::CachesPushedOutputPower<UmbrielOutputBackend>);
+  static_assert(!compositors::CachesPushedOutputPower<HyprlandOutputBackend>);
+  static_assert(!compositors::CachesPushedOutputPower<NiriOutputBackend>);
+  static_assert(!compositors::CachesPushedOutputPower<SwayOutputBackend>);
+
   template <typename BackendT> class FocusedOutputAdapter final : public compositors::FocusedOutputBackend {
   public:
     FocusedOutputAdapter() = default;
@@ -261,6 +271,10 @@ namespace {
         return m_backend.outputPowerStates();
       }
       return {};
+    }
+
+    std::unordered_map<std::string, bool> pushedOutputPowerStates() const override {
+      return compositors::pushedOutputPowerStates(m_backend);
     }
 
     void setOutputPowerChangeCallback(CompositorPlatform::ChangeCallback callback) override {
@@ -1850,6 +1864,20 @@ bool CompositorPlatform::shouldSuppressLockTransition() const {
     return false;
   }
   return m_lastRequestedOutputPowerState == false;
+}
+
+bool CompositorPlatform::allOutputsKnownOff() const {
+  std::unordered_map<std::string, bool> states;
+  for (const auto& backend : m_focusedOutputBackends) {
+    states.merge(backend->pushedOutputPowerStates());
+  }
+  std::vector<std::string> connectors;
+  for (const auto& output : m_wayland.outputs()) {
+    if (output.done && output.output != nullptr && output.hasUsableGeometry()) {
+      connectors.push_back(output.connectorName);
+    }
+  }
+  return compositors::allOutputsKnownOff(connectors, states, m_outputPowerOffPending);
 }
 
 void CompositorPlatform::setOutputPowerChangeCallback(const ChangeCallback& callback) {

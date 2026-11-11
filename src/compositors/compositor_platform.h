@@ -208,6 +208,11 @@ public:
   bool setOutputPower(bool on) const;
   void setOutputPowerOffPending(bool pending) noexcept { m_outputPowerOffPending = pending; }
   bool shouldSuppressLockTransition() const;
+  /// True only when every usable output is known to be off: a pending Noctalia power-off,
+  /// or off reports from a compositor that pushes power changes. Never runs compositor
+  /// IPC, so it is cheap enough for the lock path. Unlike shouldSuppressLockTransition(),
+  /// which answers "any output off".
+  bool allOutputsKnownOff() const;
   void setOutputPowerChangeCallback(const ChangeCallback& callback);
 
   bool tracksOverviewState() const noexcept;
