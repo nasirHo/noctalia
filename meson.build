@@ -308,6 +308,7 @@ _noctalia_compile_definitions = [
   '-DNOCTALIA_INSTALL_PREFIX="' + get_option('prefix') + '"',
   '-DNOCTALIA_INSTALL_DATADIR="' + get_option('datadir') + '"',
   '-DNOCTALIA_PAM_HELPER="' + (get_option('prefix') / get_option('libexecdir') / 'noctalia' / 'noctalia-pam-helper') + '"',
+  '-DNOCTALIA_FACE_PAM_HELPER="' + (get_option('prefix') / get_option('libexecdir') / 'noctalia' / 'noctalia-face-pam-helper') + '"',
   '-DNOCTALIA_VERSION="' + meson.project_version() + '"',
 ] + jemalloc_cpp_args
 
@@ -434,8 +435,13 @@ _noctalia_sources = files(
   'src/app/shell_library.cpp',
   'src/app/main_loop.cpp',
   'src/app/single_instance_lock.cpp',
+  'src/auth/face_helper_protocol.cpp',
   'src/auth/fingerprint_authenticator.cpp',
+  'src/auth/interactive_pam_session.cpp',
   'src/auth/pam_authenticator.cpp',
+  'src/auth/pam_helper_path.cpp',
+  'src/auth/pam_service.cpp',
+  'src/auth/posix_io.cpp',
   'src/calendar/caldav_client.cpp',
   'src/calendar/caldav_discovery.cpp',
   'src/calendar/calendar_cache.cpp',
@@ -1131,6 +1137,24 @@ executable('noctalia-pam-helper',
   install_dir: get_option('libexecdir') / 'noctalia',
 )
 
+# Face unlock runs the noctalia-face PAM service in a second helper. It needs no
+# privileges and must never share them with noctalia-pam-helper: the face stack
+# (pam_gaze) talks to a daemon. Keep its dependencies to libpam.
+executable('noctalia-face-pam-helper',
+  sources: files(
+    'src/auth/face_helper_protocol.cpp',
+    'src/auth/face_pam_helper_main.cpp',
+    'src/auth/posix_io.cpp',
+  ),
+  dependencies: [pam_dep],
+  include_directories: include_directories('src'),
+  cpp_args: [
+    '-Wall', '-Wextra', '-Wno-missing-field-initializers', '-Wpedantic', '-Wconversion', '-Wshadow',
+  ],
+  install: true,
+  install_dir: get_option('libexecdir') / 'noctalia',
+)
+
 install_subdir('assets',
   install_dir: get_option('datadir') / 'noctalia',
   exclude_files: ['dev.noctalia.Noctalia.desktop', 'dev.noctalia.Noctalia.Annotator.desktop', 'noctalia.service.in'],
@@ -1292,6 +1316,7 @@ if build_tests
     'icon_resolver',
     'icon_resolver_cache',
     'image_orientation',
+    'interactive_pam_session',
     'ipc_service',
     'iwd_diagnostics',
     'kde_color_scheme',
@@ -1316,10 +1341,12 @@ if build_tests
     'notification_inline_reply',
     'notification_icon_source',
     'notification_internal_history',
+    'pam_service',
     'path_browse',
     'pipewire_error',
     'pipewire_route_cache',
     'umbriel_audio_provider',
+    'posix_io',
     'privacy_capture_classification',
     'plugin_app_icon_path',
     'plugin_bindings',

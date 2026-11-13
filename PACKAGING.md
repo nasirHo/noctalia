@@ -77,20 +77,21 @@ No special linker is required. The default linker from the compiler driver is fi
 - `system_libraries`: `-Dsystem_libraries=true` links system copies of the vendored libraries instead of building `third_party/`. See [Vendored](#vendored-no-system-package) for the expected layout.
 - `pam_service`: PAM service the lock screen authenticates against, `login` by default. A different service (for example `-Dpam_service=noctalia`) needs a matching `/etc/pam.d/<service>` shipped by the package.
 
-Prefix/datadir are baked into the binary via `NOCTALIA_INSTALL_PREFIX` / `NOCTALIA_INSTALL_DATADIR`, and the PAM helper path (from libexecdir) via `NOCTALIA_PAM_HELPER`. Install with the same prefix you configured.
+Prefix/datadir are baked into the binary via `NOCTALIA_INSTALL_PREFIX` / `NOCTALIA_INSTALL_DATADIR`, and the PAM helper paths (from libexecdir) via `NOCTALIA_PAM_HELPER` and `NOCTALIA_FACE_PAM_HELPER`. Install with the same prefix you configured.
 
 ### Installed layout
 
 ```text
 <prefix>/bin/noctalia
 <prefix>/libexec/noctalia/noctalia-pam-helper
+<prefix>/libexec/noctalia/noctalia-face-pam-helper
 <prefix>/share/noctalia/assets/...
 <prefix>/share/applications/dev.noctalia.Noctalia.desktop
 <prefix>/share/applications/dev.noctalia.Noctalia.Annotator.desktop
 <prefix>/share/icons/hicolor/scalable/apps/noctalia.svg
 ```
 
-The shipped `assets/` tree is **required at runtime**. Shipping only the binary breaks fonts, translations, templates, glyphs, and sounds. The lock screen also needs `noctalia-pam-helper`.
+The shipped `assets/` tree is **required at runtime**. Shipping only the binary breaks fonts, translations, templates, glyphs, and sounds. The lock screen also needs `noctalia-pam-helper`, and face unlock needs `noctalia-face-pam-helper`.
 
 ### Runtime asset lookup
 
@@ -100,6 +101,7 @@ Besides the prefix layout above, portable bundle layouts are supported:
 bundle/
   noctalia
   noctalia-pam-helper
+  noctalia-face-pam-helper
   assets/
 ```
 
@@ -107,6 +109,7 @@ bundle/
 bundle/
   bin/noctalia
   bin/noctalia-pam-helper
+  bin/noctalia-face-pam-helper
   share/noctalia/assets/
 ```
 
@@ -131,7 +134,7 @@ A candidate is only accepted if it contains `fonts/noctalia-tabler.ttf` and `fon
 
 To run tests from an out-of-tree build directory, set both `NOCTALIA_APP_ASSETS_DIR=<src>/assets` and `NOCTALIA_LIBRARY_ASSETS_DIR=<src>/lib/assets`.
 
-`noctalia-pam-helper` is looked up next to the executable first, then at the compiled install path (`<prefix>/<libexecdir>/noctalia/noctalia-pam-helper`). `NOCTALIA_PAM_HELPER_PATH`, when set, must be the absolute path of the helper and replaces both lookups; a value that is not executable is an error, not a fallback.
+`noctalia-pam-helper` is looked up next to the executable first, then at the compiled install path (`<prefix>/<libexecdir>/noctalia/noctalia-pam-helper`). `NOCTALIA_PAM_HELPER_PATH`, when set, must be the absolute path of the helper and replaces both lookups; a value that is not executable is an error, not a fallback. `noctalia-face-pam-helper` is looked up the same way, at `<prefix>/<libexecdir>/noctalia/noctalia-face-pam-helper`, with its own override `NOCTALIA_FACE_PAM_HELPER_PATH`.
 
 Not shipped (don’t look for them in the install): AppStream / metainfo XML, man pages, systemd units.
 
@@ -192,7 +195,9 @@ Vendored versions: Wuffs 0.4.0-alpha.9, Luau 0.742 (0.724 also builds), fzy 1.1,
 
 The lock screen runs PAM in `noctalia-pam-helper`, a small executable that links only libpam. If unprivileged password checks on your distribution need extra privileges, grant them to this helper, never to the `noctalia` binary.
 
-A shell built on one system can use a helper built on another: the helper loads the host's PAM stack from `/etc/pam.d`. The shell still links libpam to translate PAM error codes, but does not load PAM modules. A Nix-built Noctalia on a non-NixOS host, whose own helper links nixpkgs' libpam and cannot use the host's PAM stack, works with a helper built natively (`meson compile -C build noctalia-pam-helper`) and `NOCTALIA_PAM_HELPER_PATH` pointing at it. Shell and helper check a shared protocol version on every run, so build the helper from the same Noctalia version.
+Face unlock runs the `noctalia-face` PAM service in `noctalia-face-pam-helper`, a second executable that also links only libpam. It needs no privileges: install it as a plain executable, and never make it setgid or setuid, nor give it the privileges of `noctalia-pam-helper`. Its stack (`pam_gaze`) talks to a daemon over D-Bus.
+
+A shell built on one system can use a helper built on another: the helper loads the host's PAM stack from `/etc/pam.d`. The shell still links libpam to translate PAM error codes, but does not load PAM modules. A Nix-built Noctalia on a non-NixOS host, whose own helper links nixpkgs' libpam and cannot use the host's PAM stack, works with a helper built natively (`meson compile -C build noctalia-pam-helper`) and `NOCTALIA_PAM_HELPER_PATH` pointing at it. Face unlock works the same way with `noctalia-face-pam-helper` and `NOCTALIA_FACE_PAM_HELPER_PATH`. Shell and helpers check a shared protocol version on every run, so build the helpers from the same Noctalia version.
 
 ## Startup and IPC
 

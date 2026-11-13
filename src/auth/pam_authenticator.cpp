@@ -1,11 +1,10 @@
 #include "auth/pam_authenticator.h"
 
+#include "auth/pam_helper_path.h"
 #include "auth/pam_helper_protocol.h"
 #include "core/log.h"
 
-#include <array>
 #include <cerrno>
-#include <climits>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -135,44 +134,6 @@ namespace {
     return true;
   }
 
-  // NOCTALIA_PAM_HELPER_PATH replaces the lookup, so a shell built elsewhere
-  // (e.g. by Nix on another distribution) can pair with a helper built against
-  // the host's libpam. Otherwise a helper next to the binary (build tree,
-  // bundle) wins over the installed one, so a dev build never talks to an
-  // older installed helper. Logs why nothing was found.
-  [[nodiscard]] std::string resolveHelperPath() {
-    if (const char* envPath = std::getenv("NOCTALIA_PAM_HELPER_PATH"); envPath != nullptr) {
-      if (*envPath != '/') {
-        kLog.error("NOCTALIA_PAM_HELPER_PATH must be an absolute path, got {}", envPath);
-        return {};
-      }
-      if (::access(envPath, X_OK) != 0) {
-        kLog.error("NOCTALIA_PAM_HELPER_PATH={} is not executable: {}", envPath, std::strerror(errno));
-        return {};
-      }
-      return envPath;
-    }
-
-    std::array<char, PATH_MAX> exe{};
-    const ssize_t n = ::readlink("/proc/self/exe", exe.data(), exe.size() - 1);
-    if (n > 0) {
-      std::string path(exe.data(), static_cast<std::size_t>(n));
-      const auto slash = path.rfind('/');
-      if (slash != std::string::npos) {
-        path.resize(slash + 1);
-        path += kHelperName;
-        if (::access(path.c_str(), X_OK) == 0) {
-          return path;
-        }
-      }
-    }
-    if (::access(NOCTALIA_PAM_HELPER, X_OK) == 0) {
-      return NOCTALIA_PAM_HELPER;
-    }
-    kLog.error("{} not found (expected at {})", kHelperName, NOCTALIA_PAM_HELPER);
-    return {};
-  }
-
 } // namespace
 
 PamAuthenticator::Result
@@ -186,7 +147,11 @@ PamAuthenticator::authenticateCurrentUser(std::string_view password, const Messa
     return fail();
   }
 
-  const std::string helperPath = resolveHelperPath();
+  const std::string helperPath = pam_helper_path::resolve({
+      .name = kHelperName,
+      .environmentVariable = "NOCTALIA_PAM_HELPER_PATH",
+      .installedPath = NOCTALIA_PAM_HELPER,
+  });
   if (helperPath.empty()) {
     return fail();
   }
