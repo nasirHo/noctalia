@@ -530,15 +530,16 @@ Requires [just](https://github.com/casey/just) and [meson](https://mesonbuild.co
   </TabItem>
 </Tabs>
 
-Meson installs the binary, the lock screen PAM helper and shipped assets using the normal prefix layout:
+Meson installs the binary, the lock screen PAM helpers and shipped assets using the normal prefix layout:
 
 ```text
 /usr/local/bin/noctalia
 /usr/local/libexec/noctalia/noctalia-pam-helper
+/usr/local/libexec/noctalia/noctalia-face-pam-helper
 /usr/local/share/noctalia/assets/...
 ```
 
-Noctalia needs the shipped `assets/` tree at runtime, and the lock screen needs `noctalia-pam-helper`. Copying only the `noctalia` binary is not enough.
+Noctalia needs the shipped `assets/` tree at runtime, and the lock screen needs `noctalia-pam-helper` and, for face unlock, `noctalia-face-pam-helper`. Copying only the `noctalia` binary is not enough.
 
 Portable bundle layouts are also supported:
 
@@ -546,6 +547,7 @@ Portable bundle layouts are also supported:
 bundle/
   noctalia
   noctalia-pam-helper
+  noctalia-face-pam-helper
   assets/
 ```
 
@@ -553,6 +555,7 @@ bundle/
 bundle/
   bin/noctalia
   bin/noctalia-pam-helper
+  bin/noctalia-face-pam-helper
   share/noctalia/assets/
 ```
 

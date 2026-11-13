@@ -176,17 +176,18 @@ just build
 just run
 ```
 
-Unit tests are not compiled by `just build`, which targets only the Noctalia executable and its PAM helper. Build and run them explicitly with `just test` (use `just test release` to force them on for a release build). Direct Meson users can control test target generation with the `-Dtests=enabled|disabled|auto` option. Production sources compile once into an internal static library shared by the shell and test executables.
+Unit tests are not compiled by `just build`, which targets only the Noctalia executable and its two PAM helpers. Build and run them explicitly with `just test` (use `just test release` to force them on for a release build). Direct Meson users can control test target generation with the `-Dtests=enabled|disabled|auto` option. Production sources compile once into an internal static library shared by the shell and test executables.
 
-Meson installs the binary, the lock screen PAM helper and shipped assets using the normal prefix layout:
+Meson installs the binary, the lock screen PAM helpers and shipped assets using the normal prefix layout:
 
 ```text
 /usr/local/bin/noctalia
 /usr/local/libexec/noctalia/noctalia-pam-helper
+/usr/local/libexec/noctalia/noctalia-face-pam-helper
 /usr/local/share/noctalia/assets/...
 ```
 
-Noctalia needs the shipped `assets/` tree at runtime, and the lock screen needs `noctalia-pam-helper`. Copying only the `noctalia` binary is not enough.
+Noctalia needs the shipped `assets/` tree at runtime, and the lock screen needs `noctalia-pam-helper` and, for face unlock, `noctalia-face-pam-helper`. Copying only the `noctalia` binary is not enough.
 
 Firefox theming uses the built-in template `post_action = "firefox-theme"` (same pattern as `kde-color-scheme`) plus the [Pywalfox](https://addons.mozilla.org/en-US/firefox/addon/pywalfox/) browser extension. Manual host helpers: `noctalia firefox-theme --help`.
 
@@ -196,6 +197,7 @@ Portable bundle layouts are also supported:
 bundle/
   noctalia
   noctalia-pam-helper
+  noctalia-face-pam-helper
   assets/
 ```
 
@@ -203,6 +205,7 @@ bundle/
 bundle/
   bin/noctalia
   bin/noctalia-pam-helper
+  bin/noctalia-face-pam-helper
   share/noctalia/assets/
 ```
 
